@@ -1,37 +1,38 @@
 // loopback_stream.cpp — WASAPI-Loopback-Capture -> UDP (16-Bit-PCM)
-// MinGW:  g++ -std=c++17 -O2 -Wall loopback_stream.cpp -o loopback_stream.exe -lole32 -lws2_32
+// MinGW:  g++ -std=c++17 -O2 -Wall loopback_stream.cpp -o loopback_stream.exe -lole32 -lws2_32 -getopt
 // MSVC:   cl /EHsc /O2 /std:c++17 loopback_stream.cpp
 
 #define WIN32_LEAN_AND_MEAN
 
 // MUSS VOR ALLEN ANDEREN HEADERN STEHEN
-#include <audioclient.h>
-#include <conio.h>
-#include <mmdeviceapi.h>
-#include <mmreg.h>
-#include <windows.h>
-#include <winsock2.h>
-#include <ws2tcpip.h>
-
 #include <atomic>
+#include <audioclient.h>
 #include <chrono>
 #include <cmath>
+#include <conio.h>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <mmdeviceapi.h>
+#include <mmreg.h>
+#include <string>
 #include <thread>
 #include <vector>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
 #ifdef _MSC_VER
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "ws2_32.lib")
 #endif
 
-static const char *SERVER_IP = "192.168.178.42";
-static const uint16_t SERVER_PORT = 5000;
-static const size_t MAX_UDP_PAYLOAD = 1152;
-static const double SILENCE_AFTER_MS = 60.0;
-static const double MAX_PAD_MS = 300.0;
+// Default-Werte
+static const char *DEFAULT_SERVER_IP = "192.168.178.42";
+static const uint16_t DEFAULT_SERVER_PORT = 5000;
+static const size_t DEFAULT_MAX_UDP_PAYLOAD = 1152;
+static const double DEFAULT_SILENCE_AFTER_MS = 60.0;
+static const double DEFAULT_MAX_PAD_MS = 300.0;
 
 #pragma pack(push, 1)
 struct StreamHeader {
@@ -134,7 +135,7 @@ static void ConvertToInt16(SampleKind kind, const BYTE *src, size_t samples, int
 
 class LoopbackStreamer {
 public:
-  bool InitNetwork();
+  bool InitNetwork(const std::string &serverIp, uint16_t serverPort);
   bool InitAudio();
   void Run();
   void RequestStop() { running_ = false; }
@@ -147,10 +148,10 @@ public:
 
 private:
   void DrainPackets();
-  void PadSilenceIfIdle();
+  void PadSilenceIfIdle(double silenceAfterMs, double maxPadMs);
   void QueueSamples(const int16_t *s, size_t n);
   void QueueSilence(size_t frames);
-  void FlushFullDatagrams();
+  void FlushFullDatagrams(size_t maxPayload);
   void CompactTx();
   void SendDatagram(const int16_t *s, size_t n);
 
@@ -183,7 +184,7 @@ private:
   uint64_t bytesSent_ = 0;
 };
 
-bool LoopbackStreamer::InitNetwork() {
+bool LoopbackStreamer::InitNetwork(const std::string &serverIp, uint16_t serverPort) {
   WSADATA wsa{};
   int rc = WSAStartup(MAKEWORD(2, 2), &wsa);
   if (rc != 0) {
@@ -206,11 +207,10 @@ bool LoopbackStreamer::InitNetwork() {
   DWORD sendTimeoutMs = 100;
   setsockopt(sock_, SOL_SOCKET, SO_SNDTIMEO,
              reinterpret_cast<const char *>(&sendTimeoutMs), sizeof(sendTimeoutMs));
-
   server_.sin_family = AF_INET;
-  server_.sin_port = htons(SERVER_PORT);
-  if (inet_pton(AF_INET, SERVER_IP, &server_.sin_addr) != 1) {
-    std::cerr << "Ungueltige Server-IP: " << SERVER_IP << "\n";
+  server_.sin_port = htons(serverPort);
+  if (inet_pton(AF_INET, serverIp.c_str(), &server_.sin_addr) != 1) {
+    std::cerr << "Ungueltige Server-IP: " << serverIp << "\n";
     return false;
   }
 
@@ -326,7 +326,7 @@ void LoopbackStreamer::Run() {
       break;
     }
     DrainPackets();
-    PadSilenceIfIdle();
+    PadSilenceIfIdle(DEFAULT_SILENCE_AFTER_MS, DEFAULT_MAX_PAD_MS);
   }
 
   audioClient_->Stop();
@@ -369,17 +369,17 @@ void LoopbackStreamer::DrainPackets() {
   }
 }
 
-void LoopbackStreamer::PadSilenceIfIdle() {
+void LoopbackStreamer::PadSilenceIfIdle(double silenceAfterMs, double maxPadMs) {
   const auto now = std::chrono::steady_clock::now();
   const double idleMs =
       std::chrono::duration<double, std::milli>(now - lastData_).count();
 
-  if (idleMs <= SILENCE_AFTER_MS)
+  if (idleMs <= silenceAfterMs)
     return;
 
-  double padMs = idleMs - SILENCE_AFTER_MS;
-  if (padMs > MAX_PAD_MS)
-    padMs = MAX_PAD_MS;
+  double padMs = idleMs - silenceAfterMs;
+  if (padMs > maxPadMs)
+    padMs = maxPadMs;
 
   const size_t frames =
       static_cast<size_t>(padMs * static_cast<double>(sampleRate_) / 1000.0);
@@ -394,7 +394,7 @@ void LoopbackStreamer::QueueSilence(size_t frames) {
     return;
   CompactTx();
   tx_.insert(tx_.end(), frames * channels_, int16_t{0});
-  FlushFullDatagrams();
+  FlushFullDatagrams(DEFAULT_MAX_UDP_PAYLOAD);
 }
 
 void LoopbackStreamer::QueueSamples(const int16_t *s, size_t n) {
@@ -402,7 +402,7 @@ void LoopbackStreamer::QueueSamples(const int16_t *s, size_t n) {
     return;
   CompactTx();
   tx_.insert(tx_.end(), s, s + n);
-  FlushFullDatagrams();
+  FlushFullDatagrams(DEFAULT_MAX_UDP_PAYLOAD);
 }
 
 void LoopbackStreamer::CompactTx() {
@@ -420,8 +420,8 @@ void LoopbackStreamer::CompactTx() {
   txRead_ = 0;
 }
 
-void LoopbackStreamer::FlushFullDatagrams() {
-  const size_t samplesPerPacket = MAX_UDP_PAYLOAD / sizeof(int16_t);
+void LoopbackStreamer::FlushFullDatagrams(size_t maxPayload) {
+  const size_t samplesPerPacket = maxPayload / sizeof(int16_t);
 
   while (tx_.size() - txRead_ >= samplesPerPacket) {
     SendDatagram(tx_.data() + txRead_, samplesPerPacket);
@@ -524,17 +524,118 @@ static BOOL WINAPI ConsoleCtrlHandler(DWORD ctrlType) {
     return FALSE;
   }
 }
+struct Config {
+  std::string serverIp = DEFAULT_SERVER_IP;
+  uint16_t serverPort = DEFAULT_SERVER_PORT;
+  size_t maxUdpPayload = DEFAULT_MAX_UDP_PAYLOAD;
+  double silenceAfterMs = DEFAULT_SILENCE_AFTER_MS;
+  double maxPadMs = DEFAULT_MAX_PAD_MS;
+  bool showHelp = false;
+};
 
-int main() {
+void PrintUsage(const char *progName) {
+  std::cout << "Verwendung: " << progName << " [OPTIONEN]\n"
+            << "\n"
+            << "Optionen:\n"
+            << "  -h, --help              Diese Hilfe anzeigen\n"
+            << "  -s, --server IP         Server-IP-Adresse (default: " << DEFAULT_SERVER_IP << ")\n"
+            << "  -p, --port NUM          Server-Port (default: " << DEFAULT_SERVER_PORT << ")\n"
+            << "  -m, --max-payload NUM   Maximale UDP-Payload in Bytes (default: " << DEFAULT_MAX_UDP_PAYLOAD << ")\n"
+            << "  -S, --silence AFTER_MS  Silence nach Inaktivitaet in ms (default: " << DEFAULT_SILENCE_AFTER_MS << ")\n"
+            << "  -P, --max-pad MAX_MS    Maximales Padding in ms (default: " << DEFAULT_MAX_PAD_MS << ")\n";
+}
+
+bool ParseArgs(int argc, char *argv[], Config &cfg) {
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+
+    if (arg == "-h" || arg == "--help") {
+      cfg.showHelp = true;
+      return true;
+    } else if (arg == "-s" || arg == "--server") {
+      if (i + 1 >= argc) {
+        std::cerr << "Fehler: " << arg << " benoetigt ein Argument\n";
+        return false;
+      }
+      cfg.serverIp = argv[++i];
+    } else if (arg == "-p" || arg == "--port") {
+      if (i + 1 >= argc) {
+        std::cerr << "Fehler: " << arg << " benoetigt ein Argument\n";
+        return false;
+      }
+      int port = std::atoi(argv[++i]);
+      if (port <= 0 || port > 65535) {
+        std::cerr << "Fehler: Unguenitger Port (muess zwischen 1-65535 liegen)\n";
+        return false;
+      }
+      cfg.serverPort = static_cast<uint16_t>(port);
+    } else if (arg == "-m" || arg == "--max-payload") {
+      if (i + 1 >= argc) {
+        std::cerr << "Fehler: " << arg << " benoetigt ein Argument\n";
+        return false;
+      }
+      size_t payload = std::atol(argv[++i]);
+      if (payload < 20 || payload > 65507) {
+        std::cerr << "Fehler: Unguenitger Payload-Wert (empfohlen: 20-65507)\n";
+        return false;
+      }
+      cfg.maxUdpPayload = payload;
+    } else if (arg == "-S" || arg == "--silence") {
+      if (i + 1 >= argc) {
+        std::cerr << "Fehler: " << arg << " benoetigt ein Argument\n";
+        return false;
+      }
+      cfg.silenceAfterMs = std::atof(argv[++i]);
+      if (cfg.silenceAfterMs < 0) {
+        std::cerr << "Fehler: Silience-Wert darf nicht negativ sein\n";
+        return false;
+      }
+    } else if (arg == "-P" || arg == "--max-pad") {
+      if (i + 1 >= argc) {
+        std::cerr << "Fehler: " << arg << " benoetigt ein Argument\n";
+        return false;
+      }
+      cfg.maxPadMs = std::atof(argv[++i]);
+      if (cfg.maxPadMs < 0) {
+        std::cerr << "Fehler: Max-Pad-Wert darf nicht negativ sein\n";
+        return false;
+      }
+    } else {
+      std::cerr << "Fehler: Unbekannte Option: " << arg << "\n";
+      return false;
+    }
+  }
+  return true;
+}
+
+int main(int argc, char *argv[]) {
   SetConsoleTitleA("WASAPI Loopback Streamer");
   SetConsoleCtrlHandler(ConsoleCtrlHandler, TRUE);
 
+  Config cfg;
+
+  if (!ParseArgs(argc, argv, cfg)) {
+    PrintUsage(argv[0]);
+    return 1;
+  }
+
+  if (cfg.showHelp) {
+    PrintUsage(argv[0]);
+    return 0;
+  }
+
+  // Konfigurationswerte auf Stdout ausgeben
   std::cout << "WASAPI Loopback Streamer\n";
-  std::cout << "Ziel: " << SERVER_IP << ":" << SERVER_PORT << "\n\n";
+  std::cout << "Konfiguration:\n";
+  std::cout << "  SERVER_IP:        " << cfg.serverIp << "\n";
+  std::cout << "  SERVER_PORT:      " << cfg.serverPort << "\n";
+  std::cout << "  MAX_UDP_PAYLOAD:  " << cfg.maxUdpPayload << "\n";
+  std::cout << "  SILENCE_AFTER_MS: " << cfg.silenceAfterMs << "\n";
+  std::cout << "  MAX_PAD_MS:       " << cfg.maxPadMs << "\n\n";
 
   LoopbackStreamer streamer;
 
-  if (!streamer.InitNetwork()) {
+  if (!streamer.InitNetwork(cfg.serverIp, cfg.serverPort)) {
     std::cerr << "Netzwerk-Initialisierung fehlgeschlagen.\n";
     return 1;
   }
