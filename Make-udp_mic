@@ -1,0 +1,2 @@
+#!/bin/bash
+g++ -O2 -march=native -std=c++17 udp_audio_source.cpp  -o udp_mic $(pkg-config --cflags --libs libpipewire-0.3) -lpthread
